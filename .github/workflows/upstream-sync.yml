@@ -1,0 +1,118 @@
+name: upstream sync
+
+# Optional, review-gated sync from openvenues:master (replaces pull[bot]).
+# - Opens ONE review PR when upstream has new commits; you choose to merge.
+# - Auto-resolves the recurring `versions/senzing/*` modify/delete by keeping the
+#   fork's deletion (see commit b6883bc7 "Make Senzing data model default").
+# - Never auto-merges. If you CLOSE the PR it is declined and will NOT reopen for
+#   that upstream state; a new PR only appears when upstream advances further.
+
+on:
+  schedule:
+    - cron: "20 22 * * 1" # Mondays 22:20 UTC
+  workflow_dispatch: {} # run on demand from the Actions tab
+
+permissions:
+  contents: read
+
+# Serialize runs so an overlapping scheduled + manual run can't race into two PRs.
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # push the sync branch
+      pull-requests: write # open/update the review PR
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          # A PAT or GitHub App token (contents RW + pull-requests RW). Required so
+          # the opened PR TRIGGERS the required checks (build_and_test, lint-workflows) —
+          # PRs created by the default GITHUB_TOKEN do not trigger `pull_request` runs.
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+
+      - name: Check whether upstream is ahead
+        id: check
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/openvenues/libpostal.git
+          git fetch --quiet upstream master
+          behind="$(git rev-list --count HEAD..upstream/master)"
+          echo "behind=${behind}" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse upstream/master)" >> "$GITHUB_OUTPUT"
+          echo "short=$(git rev-parse --short upstream/master)" >> "$GITHUB_OUTPUT"
+          echo "main is ${behind} commit(s) behind upstream/master."
+
+      - name: Skip if already declined for this upstream state
+        id: gate
+        if: steps.check.outputs.behind != '0'
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+          SHA: ${{ steps.check.outputs.sha }}
+        run: |
+          set -euo pipefail
+          declined="$(gh pr list --head sync/upstream --state closed \
+            --json number,body,mergedAt \
+            --jq "[.[] | select(.mergedAt == null) | select(.body | contains(\"${SHA}\"))] | .[0].number // empty")"
+          if [ -n "${declined}" ]; then
+            echo "Upstream ${SHA} was declined in closed PR #${declined} — not reopening."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build sync branch (merge upstream, keep versions/senzing/ deleted)
+        id: build
+        if: steps.gate.outputs.proceed == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name "senzing-upstream-sync[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B sync/upstream origin/main
+          if ! git merge --no-edit upstream/master; then
+            git rm -r --ignore-unmatch versions/senzing
+            others="$(git ls-files -u | awk '{print $4}' | sort -u | grep -v '^versions/senzing/' || true)"
+            if [ -n "${others}" ]; then
+              echo "::error::Upstream sync has conflicts beyond versions/senzing/ requiring manual resolution:"
+              printf '%s\n' "${others}"
+              exit 1
+            fi
+            git commit --no-edit
+          fi
+          # Nothing to adopt if the resolved result is identical to main (e.g. upstream
+          # only changed versions/senzing/, which we drop). Skip the PR — no empty nag.
+          if git diff --quiet origin/main HEAD; then
+            echo "Upstream advanced but brought no changes the fork adopts (only versions/senzing/). No PR."
+            echo "changes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "changes=true" >> "$GITHUB_OUTPUT"
+          git push --force "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:sync/upstream
+        env:
+          TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+
+      - name: Open or refresh the review PR
+        if: steps.gate.outputs.proceed == 'true' && steps.build.outputs.changes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+          SHA: ${{ steps.check.outputs.sha }}
+          SHORT: ${{ steps.check.outputs.short }}
+        run: |
+          set -euo pipefail
+          body="$(printf 'Automated review PR to sync from \`openvenues:master\`.\n\n- \`versions/senzing/*\` intentionally dropped (fork tracks \`versions/*\`).\n- Merge to adopt upstream changes; **close to decline** — it will not reopen for this upstream state.\n\n<!-- upstream-sha: %s -->\n' "${SHA}")"
+          open_pr="$(gh pr list --head sync/upstream --state open --json number --jq '.[0].number // empty')"
+          if [ -n "${open_pr}" ]; then
+            gh pr edit "${open_pr}" --title "⬇ Sync upstream openvenues:master (${SHORT})" --body "${body}"
+            echo "Refreshed existing PR #${open_pr}."
+          else
+            gh pr create --base main --head sync/upstream \
+              --title "⬇ Sync upstream openvenues:master (${SHORT})" \
+              --label ":arrow_heading_down: pull" \
+              --body "${body}"
+          fi
