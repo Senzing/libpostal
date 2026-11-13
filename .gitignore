@@ -84,3 +84,4 @@ docs/_build/
 target/
 
 .history
+.claude/settings.local.json
